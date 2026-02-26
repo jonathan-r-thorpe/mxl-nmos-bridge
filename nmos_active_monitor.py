@@ -16,7 +16,23 @@ MXL_TRANSPORT = "urn:x-nmos:transport:mxl"
 sink_processes: dict[str, subprocess.Popen] = {}
 source_processes: dict[str, subprocess.Popen] = {}
 sender_flow_ids: dict[str, str] = {}
+sender_patterns: dict[str, str] = {}
 MXL_DOMAIN = Path.home() / "mxl_domain"
+MXL_GST_DIR = Path.home() / "projects/mxl/build/Linux-GCC-Debug/tools/mxl-gst"
+TEST_PATTERNS = [
+#    "smpte", "snow", "black", "white", "red", "green", "blue",
+#    "checkers-1", "checkers-2", "checkers-4", "checkers-8",
+#    "circular", "blink", "smpte75", "zone-plate", "gamut",
+#    "chroma-zone-plate", "ball", "smpte100",
+#    "bar", "pinwheel", "spokes", "gradient", "colors",
+    "colors", "red",
+]
+
+
+def _pattern_for_sender(sender_id: str) -> str:
+    if sender_id not in sender_patterns:
+        sender_patterns[sender_id] = TEST_PATTERNS[len(sender_patterns) % len(TEST_PATTERNS)]
+    return sender_patterns[sender_id]
 
 
 def _timestamp() -> str:
@@ -114,20 +130,26 @@ def monitor(
                         flow_path.write_text(json.dumps(flow_data, indent=2))
                         print(f"  [{_timestamp()}] {key:<60} wrote {flow_path}")
                         flow_flag = "-a" if flow_data.get("format") == "urn:x-nmos:format:audio" else "-v"
+                        sender_id = key.removeprefix("senders/")
+                        pattern = _pattern_for_sender(sender_id)
                         proc = subprocess.Popen(
-                            [str(Path.home() / "projects/mxl/build/Linux-GCC-Debug/tools/mxl-gst/mxl-gst-testsrc"),
-                             "-d", str(MXL_DOMAIN), flow_flag, str(flow_path)],
+                            [str(MXL_GST_DIR / "mxl-gst-testsrc"),
+                             "-d", str(MXL_DOMAIN), flow_flag, str(flow_path),
+                             "-p", pattern],
                         )
                         source_processes[key] = proc
-                        print(f"  [{_timestamp()}] {key:<60} launched mxl-gst-testsrc (pid {proc.pid})")
+                        print(f"  [{_timestamp()}] {key:<60} launched mxl-gst-testsrc -p {pattern} (pid {proc.pid})")
 
                 if key.startswith("receivers/") and flow_id:
+                    receiver_data = fetch_json(f"{node_url}/{key}")
+                    format = receiver_data.get("format") if receiver_data else None
+                    flow_flag = "-a" if format == "urn:x-nmos:format:audio" else "-v"
                     proc = subprocess.Popen(
-                        [str(Path.home() / "projects/mxl/build/Linux-GCC-Debug/tools/mxl-gst/mxl-gst-sink"),
-                         "-d", str(MXL_DOMAIN), "-v", flow_id],
+                        [str(MXL_GST_DIR / "mxl-gst-sink"),
+                         "-d", str(MXL_DOMAIN), flow_flag, flow_id],
                     )
                     sink_processes[key] = proc
-                    print(f"  [{_timestamp()}] {key:<60} launched mxl-gst-sink (pid {proc.pid})")
+                    print(f"  [{_timestamp()}] {key:<60} launched mxl-gst-sink {flow_flag} (pid {proc.pid})")
 
             if not master_enable and prev:
                 if key.startswith("senders/") and key in sender_flow_ids:
