@@ -3,6 +3,7 @@
 import argparse
 import json
 import subprocess
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -16,8 +17,11 @@ MXL_TRANSPORT = "urn:x-nmos:transport:mxl"
 sink_processes: dict[str, subprocess.Popen] = {}
 source_processes: dict[str, subprocess.Popen] = {}
 sender_flow_ids: dict[str, str] = {}
+receiver_activation_times: dict[str, str] = {}
 sender_patterns: dict[str, str] = {}
 MXL_DOMAIN = Path.home() / "mxl_domain"
+# Flow descriptor JSON for mxl-gst-testsrc (not part of the MXL domain tree).
+DEFAULT_MXL_FLOW_JSON_DIR = Path(tempfile.gettempdir()) / "nmos-active-monitor-mxl-flows"
 MXL_GST_DIR = Path.home() / "projects/mxl/build/Linux-GCC-Debug/tools/mxl-gst"
 TEST_PATTERNS = [
 #    "smpte", "snow", "black", "white", "red", "green", "blue",
@@ -33,6 +37,27 @@ def _pattern_for_sender(sender_id: str) -> str:
     if sender_id not in sender_patterns:
         sender_patterns[sender_id] = TEST_PATTERNS[len(sender_patterns) % len(TEST_PATTERNS)]
     return sender_patterns[sender_id]
+
+
+def _launch_sink(key: str, flow_id: str, activation_time: str, node_url: str) -> None:
+    receiver_data = fetch_json(f"{node_url}/{key}")
+    format = receiver_data.get("format") if receiver_data else None
+    flow_flag = "-a" if format == "urn:x-nmos:format:audio" else "-v"
+    proc = subprocess.Popen(
+        [str(MXL_GST_DIR / "mxl-gst-sink"),
+         "-d", str(MXL_DOMAIN), flow_flag, flow_id],
+    )
+    sink_processes[key] = proc
+    receiver_activation_times[key] = activation_time
+    print(f"  [{_timestamp()}] {key:<60} launched mxl-gst-sink {flow_flag} (pid {proc.pid})")
+
+
+def _terminate_sink(key: str) -> None:
+    if key in sink_processes:
+        sink_processes[key].terminate()
+        print(f"  [{_timestamp()}] {key:<60} terminated mxl-gst-sink")
+        del sink_processes[key]
+    receiver_activation_times.pop(key, None)
 
 
 def _timestamp() -> str:
@@ -71,7 +96,10 @@ def monitor(
     base_url: str,
     poll_interval: float = 1.0,
     rediscover_every: int = 30,
+    flow_json_dir: Path | None = None,
 ) -> None:
+    flow_dir = flow_json_dir or DEFAULT_MXL_FLOW_JSON_DIR
+    flow_dir.mkdir(parents=True, exist_ok=True)
     active_state: dict[str, bool | None] = {}
     node_url = base_url.replace("/x-nmos/connection/v1.2", "/x-nmos/node/v1.3")
     polls_since_discovery = rediscover_every  # force initial discovery
@@ -126,7 +154,7 @@ def monitor(
                                 source_data = fetch_json(f"{node_url}/sources/{source_id}")
                                 if source_data:
                                     flow_data["channel_count"] = len(source_data.get("channels", []))
-                        flow_path = MXL_DOMAIN / f"{flow_id}.json"
+                        flow_path = flow_dir / f"{flow_id}.json"
                         flow_path.write_text(json.dumps(flow_data, indent=2))
                         print(f"  [{_timestamp()}] {key:<60} wrote {flow_path}")
                         flow_flag = "-a" if flow_data.get("format") == "urn:x-nmos:format:audio" else "-v"
@@ -141,15 +169,8 @@ def monitor(
                         print(f"  [{_timestamp()}] {key:<60} launched mxl-gst-testsrc -p {pattern} (pid {proc.pid})")
 
                 if key.startswith("receivers/") and flow_id:
-                    receiver_data = fetch_json(f"{node_url}/{key}")
-                    format = receiver_data.get("format") if receiver_data else None
-                    flow_flag = "-a" if format == "urn:x-nmos:format:audio" else "-v"
-                    proc = subprocess.Popen(
-                        [str(MXL_GST_DIR / "mxl-gst-sink"),
-                         "-d", str(MXL_DOMAIN), flow_flag, flow_id],
-                    )
-                    sink_processes[key] = proc
-                    print(f"  [{_timestamp()}] {key:<60} launched mxl-gst-sink {flow_flag} (pid {proc.pid})")
+                    activation_time = data.get("activation", {}).get("activation_time")
+                    _launch_sink(key, flow_id, activation_time, node_url)
 
             if not master_enable and prev:
                 if key.startswith("senders/") and key in sender_flow_ids:
@@ -157,15 +178,23 @@ def monitor(
                         source_processes[key].terminate()
                         print(f"  [{_timestamp()}] {key:<60} terminated mxl-gst-testsrc")
                         del source_processes[key]
-                    flow_path = MXL_DOMAIN / f"{sender_flow_ids[key]}.json"
+                    flow_path = flow_dir / f"{sender_flow_ids[key]}.json"
                     flow_path.unlink(missing_ok=True)
                     print(f"  [{_timestamp()}] {key:<60} removed {flow_path}")
                     del sender_flow_ids[key]
 
-                if key.startswith("receivers/") and key in sink_processes:
-                    sink_processes[key].terminate()
-                    print(f"  [{_timestamp()}] {key:<60} terminated mxl-gst-sink")
-                    del sink_processes[key]
+                if key.startswith("receivers/"):
+                    _terminate_sink(key)
+
+            if master_enable and prev and key.startswith("receivers/"):
+                activation_time = data.get("activation", {}).get("activation_time")
+                prev_activation_time = receiver_activation_times.get(key)
+                if activation_time and activation_time != prev_activation_time:
+                    flow_id = data.get("transport_params", [{}])[0].get("flow_id")
+                    print(f"  [{_timestamp()}] {key:<60} re-activated: {prev_activation_time} -> {activation_time}")
+                    _terminate_sink(key)
+                    if flow_id:
+                        _launch_sink(key, flow_id, activation_time, node_url)
 
             active_state[key] = master_enable
 
@@ -194,6 +223,15 @@ if __name__ == "__main__":
         default=30,
         help="Re-discover resources every N polls (default: 30)",
     )
+    parser.add_argument(
+        "--flow-json-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for temporary flow JSON files passed to mxl-gst-testsrc "
+            f"(default: {DEFAULT_MXL_FLOW_JSON_DIR})"
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -201,6 +239,7 @@ if __name__ == "__main__":
             base_url=args.base_url.rstrip("/"),
             poll_interval=args.interval,
             rediscover_every=args.rediscover,
+            flow_json_dir=args.flow_json_dir,
         )
     except KeyboardInterrupt:
         for key, proc in source_processes.items():
@@ -210,7 +249,7 @@ if __name__ == "__main__":
             proc.terminate()
             print(f"  [{_timestamp()}] {key:<60} terminated mxl-gst-sink")
         for key, flow_id in sender_flow_ids.items():
-            flow_path = MXL_DOMAIN / f"{flow_id}.json"
+            flow_path = (args.flow_json_dir or DEFAULT_MXL_FLOW_JSON_DIR) / f"{flow_id}.json"
             flow_path.unlink(missing_ok=True)
             print(f"  [{_timestamp()}] {key:<60} removed {flow_path}")
         print(f"\n[{_timestamp()}] Stopped.")
