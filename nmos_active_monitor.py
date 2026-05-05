@@ -20,6 +20,7 @@ sender_flow_ids: dict[str, str] = {}
 receiver_activation_times: dict[str, str] = {}
 sender_patterns: dict[str, str] = {}
 MXL_DOMAIN = Path.home() / "mxl_domain"
+MXL_DOMAIN_DEF_NAME = "domain_def.json"
 # Flow descriptor JSON for mxl-gst-testsrc (not part of the MXL domain tree).
 DEFAULT_MXL_FLOW_JSON_DIR = Path(tempfile.gettempdir()) / "nmos-active-monitor-mxl-flows"
 MXL_GST_DIR = Path.home() / "projects/mxl/build/Linux-GCC-Debug/tools/mxl-gst"
@@ -33,13 +34,92 @@ TEST_PATTERNS = [
 ]
 
 
+def _transport_params_first(data: dict) -> dict:
+    tp = data.get("transport_params") or []
+    return tp[0] if tp else {}
+
+
+def _mxl_flow_id_from_tp(tp0: dict) -> str | None:
+    """IS-05 MXL transport uses ``mxl_flow_id`` (legacy: ``flow_id``)."""
+    v = tp0.get("mxl_flow_id") or tp0.get("flow_id")
+    return str(v).strip() if v else None
+
+
+def _write_mxl_domain_def(domain_root: Path, mxl_domain_id: str) -> Path:
+    """Write ``domain_def.json`` at the root of the MXL domain directory."""
+    domain_root.mkdir(parents=True, exist_ok=True)
+    path = domain_root / MXL_DOMAIN_DEF_NAME
+    payload = {
+        "id": mxl_domain_id,
+        "label": "NVIDIA MXL Domain",
+        "description": "NVIDIA MXL Domain",
+    }
+    path.write_text(json.dumps(payload, indent=4) + "\n")
+    return path
+
+
+def _normalize_mxl_domain_id(s: str) -> str:
+    return str(s).strip().casefold()
+
+
+def _read_domain_def_id(domain_root: Path) -> str | None:
+    """Return the ``id`` from ``domain_def.json``, or None if missing or unreadable."""
+    path = domain_root / MXL_DOMAIN_DEF_NAME
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    vid = raw.get("id") if isinstance(raw, dict) else None
+    return str(vid).strip() if vid else None
+
+
+def _validate_receiver_mxl_domain(
+    domain_root: Path, mxl_domain_id: str | None
+) -> tuple[bool, str]:
+    """
+    Ensure the active transport ``mxl_domain_id`` matches ``domain_def.json`` on disk.
+    Returns (True, "") if valid, else (False, reason).
+    """
+    if mxl_domain_id is None or not str(mxl_domain_id).strip():
+        return False, "transport_params missing mxl_domain_id"
+    req = _normalize_mxl_domain_id(str(mxl_domain_id))
+    disk_id = _read_domain_def_id(domain_root)
+    def_path = domain_root / MXL_DOMAIN_DEF_NAME
+    if disk_id is None:
+        return (
+            False,
+            f"cannot read domain id from {def_path} (missing, invalid JSON, or no id field)",
+        )
+    if _normalize_mxl_domain_id(disk_id) != req:
+        return (
+            False,
+            f"mxl_domain_id {mxl_domain_id!r} does not match domain_def.json id {disk_id!r} "
+            "(different MXL domain; out of scope)",
+        )
+    return True, ""
+
+
 def _pattern_for_sender(sender_id: str) -> str:
     if sender_id not in sender_patterns:
         sender_patterns[sender_id] = TEST_PATTERNS[len(sender_patterns) % len(TEST_PATTERNS)]
     return sender_patterns[sender_id]
 
 
-def _launch_sink(key: str, flow_id: str, activation_time: str, node_url: str) -> None:
+def _launch_sink(
+    key: str,
+    flow_id: str,
+    activation_time: str,
+    node_url: str,
+    mxl_domain_id: str | None,
+) -> bool:
+    ok, err = _validate_receiver_mxl_domain(MXL_DOMAIN, mxl_domain_id)
+    if not ok:
+        print(
+            f"  [{_timestamp()}] {key:<60} ERROR: MXL receiver domain validation failed: {err}"
+        )
+        return False
     receiver_data = fetch_json(f"{node_url}/{key}")
     format = receiver_data.get("format") if receiver_data else None
     flow_flag = "-a" if format == "urn:x-nmos:format:audio" else "-v"
@@ -50,6 +130,7 @@ def _launch_sink(key: str, flow_id: str, activation_time: str, node_url: str) ->
     sink_processes[key] = proc
     receiver_activation_times[key] = activation_time
     print(f"  [{_timestamp()}] {key:<60} launched mxl-gst-sink {flow_flag} (pid {proc.pid})")
+    return True
 
 
 def _terminate_sink(key: str) -> None:
@@ -138,10 +219,22 @@ def monitor(
                 print(f"  [{_timestamp()}] {key:<60} became INACTIVE")
 
             if master_enable and not prev:
-                flow_id = data.get("transport_params", [{}])[0].get("flow_id")
-                print(f"  [{_timestamp()}] {key:<60} flow_id: {flow_id}")
+                tp0 = _transport_params_first(data)
+                flow_id = _mxl_flow_id_from_tp(tp0)
+                print(f"  [{_timestamp()}] {key:<60} mxl_flow_id: {flow_id}")
 
                 if key.startswith("senders/") and flow_id:
+                    mxl_domain_id = tp0.get("mxl_domain_id")
+                    if mxl_domain_id:
+                        def_path = _write_mxl_domain_def(
+                            MXL_DOMAIN, str(mxl_domain_id).strip()
+                        )
+                        print(f"  [{_timestamp()}] {key:<60} wrote {def_path}")
+                    else:
+                        print(
+                            f"  [{_timestamp()}] {key:<60} "
+                            "WARNING: transport_params missing mxl_domain_id"
+                        )
                     sender_flow_ids[key] = flow_id
                     flow_data = fetch_json(f"{node_url}/flows/{flow_id}")
                     if flow_data:
@@ -170,7 +263,13 @@ def monitor(
 
                 if key.startswith("receivers/") and flow_id:
                     activation_time = data.get("activation", {}).get("activation_time")
-                    _launch_sink(key, flow_id, activation_time, node_url)
+                    _launch_sink(
+                        key,
+                        flow_id,
+                        activation_time,
+                        node_url,
+                        tp0.get("mxl_domain_id"),
+                    )
 
             if not master_enable and prev:
                 if key.startswith("senders/") and key in sender_flow_ids:
@@ -190,11 +289,18 @@ def monitor(
                 activation_time = data.get("activation", {}).get("activation_time")
                 prev_activation_time = receiver_activation_times.get(key)
                 if activation_time and activation_time != prev_activation_time:
-                    flow_id = data.get("transport_params", [{}])[0].get("flow_id")
+                    tp0 = _transport_params_first(data)
+                    flow_id = _mxl_flow_id_from_tp(tp0)
                     print(f"  [{_timestamp()}] {key:<60} re-activated: {prev_activation_time} -> {activation_time}")
                     _terminate_sink(key)
                     if flow_id:
-                        _launch_sink(key, flow_id, activation_time, node_url)
+                        _launch_sink(
+                            key,
+                            flow_id,
+                            activation_time,
+                            node_url,
+                            tp0.get("mxl_domain_id"),
+                        )
 
             active_state[key] = master_enable
 
