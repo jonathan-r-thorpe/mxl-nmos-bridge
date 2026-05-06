@@ -100,8 +100,10 @@ def _launch_sink(
     activation_time: str,
     node_url: str,
     mxl_domain_id: str | None,
+    mxl_domain: Path,
+    mxl_gst_dir: Path,
 ) -> bool:
-    ok, err = _validate_mxl_domain(MXL_DOMAIN, mxl_domain_id)
+    ok, err = _validate_mxl_domain(mxl_domain, mxl_domain_id)
     if not ok:
         print(
             f"  [{_timestamp()}] {key:<60} ERROR: MXL receiver domain validation failed: {err}"
@@ -111,8 +113,8 @@ def _launch_sink(
     format = receiver_data.get("format") if receiver_data else None
     flow_flag = "-a" if format == "urn:x-nmos:format:audio" else "-v"
     proc = subprocess.Popen(
-        [str(MXL_GST_DIR / "mxl-gst-sink"),
-         "-d", str(MXL_DOMAIN), flow_flag, flow_id],
+        [str(mxl_gst_dir / "mxl-gst-sink"),
+         "-d", str(mxl_domain), flow_flag, flow_id],
     )
     sink_processes[key] = proc
     receiver_activation_times[key] = activation_time
@@ -165,6 +167,8 @@ def monitor(
     poll_interval: float = 1.0,
     rediscover_every: int = 30,
     flow_json_dir: Path | None = None,
+    mxl_domain: Path = MXL_DOMAIN,
+    mxl_gst_dir: Path = MXL_GST_DIR,
 ) -> None:
     flow_dir = flow_json_dir or DEFAULT_MXL_FLOW_JSON_DIR
     flow_dir.mkdir(parents=True, exist_ok=True)
@@ -174,6 +178,7 @@ def monitor(
 
     print(f"[{_timestamp()}] Monitoring NMOS IS-05 MXL active endpoints at {base_url}")
     print(f"  Poll interval: {poll_interval}s | Re-discovery every {rediscover_every} polls")
+    print(f"  MXL domain: {mxl_domain} | mxl-gst: {mxl_gst_dir}")
     print()
 
     while True:
@@ -212,7 +217,7 @@ def monitor(
 
                 if key.startswith("senders/") and flow_id:
                     ok_domain, err_domain = _validate_mxl_domain(
-                        MXL_DOMAIN, tp0.get("mxl_domain_id")
+                        mxl_domain, tp0.get("mxl_domain_id")
                     )
                     if not ok_domain:
                         print(
@@ -239,8 +244,8 @@ def monitor(
                             sender_id = key.removeprefix("senders/")
                             pattern = _pattern_for_sender(sender_id)
                             proc = subprocess.Popen(
-                                [str(MXL_GST_DIR / "mxl-gst-testsrc"),
-                                 "-d", str(MXL_DOMAIN), flow_flag, str(flow_path),
+                                [str(mxl_gst_dir / "mxl-gst-testsrc"),
+                                 "-d", str(mxl_domain), flow_flag, str(flow_path),
                                  "-p", pattern],
                             )
                             source_processes[key] = proc
@@ -254,6 +259,8 @@ def monitor(
                         activation_time,
                         node_url,
                         tp0.get("mxl_domain_id"),
+                        mxl_domain,
+                        mxl_gst_dir,
                     )
 
             if not master_enable and prev:
@@ -285,6 +292,8 @@ def monitor(
                             activation_time,
                             node_url,
                             tp0.get("mxl_domain_id"),
+                            mxl_domain,
+                            mxl_gst_dir,
                         )
 
             active_state[key] = master_enable
@@ -323,6 +332,18 @@ if __name__ == "__main__":
             f"(default: {DEFAULT_MXL_FLOW_JSON_DIR})"
         ),
     )
+    parser.add_argument(
+        "--mxl-domain",
+        type=Path,
+        default=MXL_DOMAIN,
+        help=f"MXL domain root (domain_def.json); passed to mxl-gst -d (default: {MXL_DOMAIN})",
+    )
+    parser.add_argument(
+        "--mxl-gst-dir",
+        type=Path,
+        default=MXL_GST_DIR,
+        help=f"Directory containing mxl-gst-testsrc and mxl-gst-sink (default: {MXL_GST_DIR})",
+    )
     args = parser.parse_args()
 
     try:
@@ -331,6 +352,8 @@ if __name__ == "__main__":
             poll_interval=args.interval,
             rediscover_every=args.rediscover,
             flow_json_dir=args.flow_json_dir,
+            mxl_domain=args.mxl_domain.expanduser(),
+            mxl_gst_dir=args.mxl_gst_dir.expanduser(),
         )
     except KeyboardInterrupt:
         for key, proc in source_processes.items():
