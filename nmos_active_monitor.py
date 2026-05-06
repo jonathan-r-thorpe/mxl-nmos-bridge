@@ -40,8 +40,8 @@ def _transport_params_first(data: dict) -> dict:
 
 
 def _mxl_flow_id_from_tp(tp0: dict) -> str | None:
-    """IS-05 MXL transport uses ``mxl_flow_id`` (legacy: ``flow_id``)."""
-    v = tp0.get("mxl_flow_id") or tp0.get("flow_id")
+    """IS-05 MXL transport uses ``mxl_flow_id``."""
+    v = tp0.get("mxl_flow_id")
     return str(v).strip() if v else None
 
 
