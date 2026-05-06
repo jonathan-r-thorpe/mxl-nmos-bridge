@@ -302,49 +302,164 @@ def monitor(
         time.sleep(poll_interval)
 
 
-if __name__ == "__main__":
+CONFIG_KEYS = frozenset(
+    {
+        "base_url",
+        "interval",
+        "rediscover",
+        "flow_json_dir",
+        "mxl_domain",
+        "mxl_gst_dir",
+    }
+)
+
+
+def load_config_file(path: Path) -> dict[str, object]:
+    """
+    Load JSON object from a local path. Unknown keys are rejected.
+    Returns validated fields present in the file (subset of CONFIG_KEYS).
+    """
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(f"Cannot read config file {path}: {exc}") from exc
+    try:
+        raw = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid JSON in {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise SystemExit(
+            f"Config root must be a JSON object, got {type(raw).__name__}"
+        )
+    unknown = set(raw) - CONFIG_KEYS
+    if unknown:
+        raise SystemExit(
+            "Unknown config keys (strict): " + ", ".join(sorted(unknown))
+        )
+
+    out: dict[str, object] = {}
+    if "base_url" in raw:
+        v = raw["base_url"]
+        if not isinstance(v, str) or not v.strip():
+            raise SystemExit("Config key base_url must be a non-empty string")
+        out["base_url"] = v.strip()
+    if "interval" in raw:
+        v = raw["interval"]
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise SystemExit("Config key interval must be a number")
+        out["interval"] = float(v)
+    if "rediscover" in raw:
+        v = raw["rediscover"]
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise SystemExit("Config key rediscover must be an integer")
+        out["rediscover"] = int(v)
+    if "flow_json_dir" in raw:
+        v = raw["flow_json_dir"]
+        if v is None:
+            out["flow_json_dir"] = None
+        elif isinstance(v, str):
+            out["flow_json_dir"] = Path(v).expanduser()
+        else:
+            raise SystemExit(
+                "Config key flow_json_dir must be a string path or null"
+            )
+    if "mxl_domain" in raw:
+        v = raw["mxl_domain"]
+        if not isinstance(v, str) or not v.strip():
+            raise SystemExit("Config key mxl_domain must be a non-empty string")
+        out["mxl_domain"] = Path(v).expanduser()
+    if "mxl_gst_dir" in raw:
+        v = raw["mxl_gst_dir"]
+        if not isinstance(v, str) or not v.strip():
+            raise SystemExit("Config key mxl_gst_dir must be a non-empty string")
+        out["mxl_gst_dir"] = Path(v).expanduser()
+    return out
+
+
+def _build_arg_parser(defaults: dict[str, object]) -> argparse.ArgumentParser:
+    d = defaults
     parser = argparse.ArgumentParser(
-        description="Poll NMOS IS-05 active endpoints for state changes",
+        description=(
+            "Poll NMOS IS-05 active endpoints for state changes. "
+            "Optional --config PATH loads defaults from a local JSON file; "
+            "CLI flags override the file."
+        ),
+        epilog=(
+            "Strict JSON object keys (snake_case): "
+            + ", ".join(sorted(CONFIG_KEYS))
+            + ". Use --config PATH (local file) on the command line; it may appear "
+            "before or after other flags."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--base-url",
-        default=BASE_URL,
-        help=f"Base Connection API URL (default: {BASE_URL})",
+        dest="base_url",
+        default=d["base_url"],
+        help=f"Base Connection API URL (default: {d['base_url']!r})",
     )
     parser.add_argument(
         "--interval",
         type=float,
-        default=1.0,
-        help="Polling interval in seconds (default: 1.0)",
+        default=d["interval"],
+        help=f"Polling interval in seconds (default: {d['interval']})",
     )
     parser.add_argument(
         "--rediscover",
         type=int,
-        default=30,
-        help="Re-discover resources every N polls (default: 30)",
+        default=d["rediscover"],
+        help=f"Re-discover resources every N polls (default: {d['rediscover']})",
     )
     parser.add_argument(
         "--flow-json-dir",
         type=Path,
-        default=None,
+        default=d["flow_json_dir"],
         help=(
             "Directory for temporary flow JSON files passed to mxl-gst-testsrc "
-            f"(default: {DEFAULT_MXL_FLOW_JSON_DIR})"
+            f"(default: {d['flow_json_dir']!r})"
         ),
     )
     parser.add_argument(
         "--mxl-domain",
+        dest="mxl_domain",
         type=Path,
-        default=MXL_DOMAIN,
-        help=f"MXL domain root (domain_def.json); passed to mxl-gst -d (default: {MXL_DOMAIN})",
+        default=d["mxl_domain"],
+        help=(
+            "MXL domain root (domain_def.json); passed to mxl-gst -d "
+            f"(default: {d['mxl_domain']!r})"
+        ),
     )
     parser.add_argument(
         "--mxl-gst-dir",
+        dest="mxl_gst_dir",
         type=Path,
-        default=MXL_GST_DIR,
-        help=f"Directory containing mxl-gst-testsrc and mxl-gst-sink (default: {MXL_GST_DIR})",
+        default=d["mxl_gst_dir"],
+        help=(
+            "Directory containing mxl-gst-testsrc and mxl-gst-sink "
+            f"(default: {d['mxl_gst_dir']!r})"
+        ),
     )
-    args = parser.parse_args()
+    return parser
+
+
+if __name__ == "__main__":
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=Path, default=None)
+    pre_args, argv_rest = pre.parse_known_args()
+    file_defaults: dict[str, object] = {}
+    if pre_args.config is not None:
+        file_defaults = load_config_file(pre_args.config.expanduser())
+
+    merged_defaults: dict[str, object] = {
+        "base_url": file_defaults.get("base_url", BASE_URL),
+        "interval": file_defaults.get("interval", 1.0),
+        "rediscover": file_defaults.get("rediscover", 30),
+        "flow_json_dir": file_defaults.get("flow_json_dir"),
+        "mxl_domain": file_defaults.get("mxl_domain", MXL_DOMAIN),
+        "mxl_gst_dir": file_defaults.get("mxl_gst_dir", MXL_GST_DIR),
+    }
+    parser = _build_arg_parser(merged_defaults)
+    args = parser.parse_args(argv_rest)
 
     try:
         monitor(
