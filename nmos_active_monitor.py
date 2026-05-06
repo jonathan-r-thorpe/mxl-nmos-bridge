@@ -19,7 +19,7 @@ source_processes: dict[str, subprocess.Popen] = {}
 sender_flow_ids: dict[str, str] = {}
 receiver_activation_times: dict[str, str] = {}
 sender_patterns: dict[str, str] = {}
-MXL_DOMAIN = Path.home() / "mxl_domain"
+MXL_DOMAIN = Path("/dev/shm/mxl")
 MXL_DOMAIN_DEF_NAME = "domain_def.json"
 # Flow descriptor JSON for mxl-gst-testsrc (not part of the MXL domain tree).
 DEFAULT_MXL_FLOW_JSON_DIR = Path(tempfile.gettempdir()) / "nmos-active-monitor-mxl-flows"
