@@ -45,19 +45,6 @@ def _mxl_flow_id_from_tp(tp0: dict) -> str | None:
     return str(v).strip() if v else None
 
 
-def _write_mxl_domain_def(domain_root: Path, mxl_domain_id: str) -> Path:
-    """Write ``domain_def.json`` at the root of the MXL domain directory."""
-    domain_root.mkdir(parents=True, exist_ok=True)
-    path = domain_root / MXL_DOMAIN_DEF_NAME
-    payload = {
-        "id": mxl_domain_id,
-        "label": "NVIDIA MXL Domain",
-        "description": "NVIDIA MXL Domain",
-    }
-    path.write_text(json.dumps(payload, indent=4) + "\n")
-    return path
-
-
 def _normalize_mxl_domain_id(s: str) -> str:
     return str(s).strip().casefold()
 
@@ -75,12 +62,12 @@ def _read_domain_def_id(domain_root: Path) -> str | None:
     return str(vid).strip() if vid else None
 
 
-def _validate_receiver_mxl_domain(
+def _validate_mxl_domain(
     domain_root: Path, mxl_domain_id: str | None
 ) -> tuple[bool, str]:
     """
-    Ensure the active transport ``mxl_domain_id`` matches ``domain_def.json`` on disk.
-    Returns (True, "") if valid, else (False, reason).
+    Ensure ``mxl_domain_id`` matches the ``id`` in pre-configured ``domain_def.json``
+    at ``domain_root``. Returns (True, "") if valid, else (False, reason).
     """
     if mxl_domain_id is None or not str(mxl_domain_id).strip():
         return False, "transport_params missing mxl_domain_id"
@@ -114,7 +101,7 @@ def _launch_sink(
     node_url: str,
     mxl_domain_id: str | None,
 ) -> bool:
-    ok, err = _validate_receiver_mxl_domain(MXL_DOMAIN, mxl_domain_id)
+    ok, err = _validate_mxl_domain(MXL_DOMAIN, mxl_domain_id)
     if not ok:
         print(
             f"  [{_timestamp()}] {key:<60} ERROR: MXL receiver domain validation failed: {err}"
@@ -224,42 +211,40 @@ def monitor(
                 print(f"  [{_timestamp()}] {key:<60} mxl_flow_id: {flow_id}")
 
                 if key.startswith("senders/") and flow_id:
-                    mxl_domain_id = tp0.get("mxl_domain_id")
-                    if mxl_domain_id:
-                        def_path = _write_mxl_domain_def(
-                            MXL_DOMAIN, str(mxl_domain_id).strip()
-                        )
-                        print(f"  [{_timestamp()}] {key:<60} wrote {def_path}")
-                    else:
+                    ok_domain, err_domain = _validate_mxl_domain(
+                        MXL_DOMAIN, tp0.get("mxl_domain_id")
+                    )
+                    if not ok_domain:
                         print(
                             f"  [{_timestamp()}] {key:<60} "
-                            "WARNING: transport_params missing mxl_domain_id"
+                            f"ERROR: MXL sender domain validation failed: {err_domain}"
                         )
-                    sender_flow_ids[key] = flow_id
-                    flow_data = fetch_json(f"{node_url}/flows/{flow_id}")
-                    if flow_data:
-                        resource_data = fetch_json(f"{node_url}/{key}")
-                        if resource_data:
-                            flow_data["tags"] = resource_data.get("tags", {})
-                        if flow_data.get("format") == "urn:x-nmos:format:audio":
-                            source_id = flow_data.get("source_id")
-                            if source_id:
-                                source_data = fetch_json(f"{node_url}/sources/{source_id}")
-                                if source_data:
-                                    flow_data["channel_count"] = len(source_data.get("channels", []))
-                        flow_path = flow_dir / f"{flow_id}.json"
-                        flow_path.write_text(json.dumps(flow_data, indent=2))
-                        print(f"  [{_timestamp()}] {key:<60} wrote {flow_path}")
-                        flow_flag = "-a" if flow_data.get("format") == "urn:x-nmos:format:audio" else "-v"
-                        sender_id = key.removeprefix("senders/")
-                        pattern = _pattern_for_sender(sender_id)
-                        proc = subprocess.Popen(
-                            [str(MXL_GST_DIR / "mxl-gst-testsrc"),
-                             "-d", str(MXL_DOMAIN), flow_flag, str(flow_path),
-                             "-p", pattern],
-                        )
-                        source_processes[key] = proc
-                        print(f"  [{_timestamp()}] {key:<60} launched mxl-gst-testsrc -p {pattern} (pid {proc.pid})")
+                    else:
+                        sender_flow_ids[key] = flow_id
+                        flow_data = fetch_json(f"{node_url}/flows/{flow_id}")
+                        if flow_data:
+                            resource_data = fetch_json(f"{node_url}/{key}")
+                            if resource_data:
+                                flow_data["tags"] = resource_data.get("tags", {})
+                            if flow_data.get("format") == "urn:x-nmos:format:audio":
+                                source_id = flow_data.get("source_id")
+                                if source_id:
+                                    source_data = fetch_json(f"{node_url}/sources/{source_id}")
+                                    if source_data:
+                                        flow_data["channel_count"] = len(source_data.get("channels", []))
+                            flow_path = flow_dir / f"{flow_id}.json"
+                            flow_path.write_text(json.dumps(flow_data, indent=2))
+                            print(f"  [{_timestamp()}] {key:<60} wrote {flow_path}")
+                            flow_flag = "-a" if flow_data.get("format") == "urn:x-nmos:format:audio" else "-v"
+                            sender_id = key.removeprefix("senders/")
+                            pattern = _pattern_for_sender(sender_id)
+                            proc = subprocess.Popen(
+                                [str(MXL_GST_DIR / "mxl-gst-testsrc"),
+                                 "-d", str(MXL_DOMAIN), flow_flag, str(flow_path),
+                                 "-p", pattern],
+                            )
+                            source_processes[key] = proc
+                            print(f"  [{_timestamp()}] {key:<60} launched mxl-gst-testsrc -p {pattern} (pid {proc.pid})")
 
                 if key.startswith("receivers/") and flow_id:
                     activation_time = data.get("activation", {}).get("activation_time")
